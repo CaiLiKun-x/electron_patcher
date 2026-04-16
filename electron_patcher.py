@@ -1,20 +1,23 @@
 """
 electron_patcher.py: Enforce 'use-angle@1' in Chrome and Electron applications
 
-Version 4.0.3 (2026-04-16)
+Version 4.0.4 (2026-04-16)
 
 策略：
   - Electron 应用：修改 Local State 文件
-  - Chrome / Edge：通过二进制包装脚本注入 --use-angle=gl 命令行参数
+  - Chrome / Edge：Launcher 方案——将原始 .app bundle 整体重命名备份，
+    在原位置创建最小 launcher .app，exec 原始 binary 并注入 --use-angle=gl。
+    原始 bundle 的 Google 代码签名完整保留，Keychain 和账号登录不受影响。
+  - 无 Local State 的其他 Electron 应用：二进制包装脚本注入
 
 注意：
-  - 修改 Chrome/Edge 会破坏代码签名，脚本会自动进行 ad-hoc 重签名
-  - 浏览器更新后包装脚本会被覆盖，需重新运行本脚本
+  - Chrome/Edge 更新后 launcher 可能被覆盖，需重新运行本脚本
   - 需要对 /Applications 目录有写权限（可能需要 sudo）
 """
 
 import enum
 import json
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -202,6 +205,96 @@ class ChromiumBinaryPatcher:
 
 
 # ---------------------------------------------------------------------------
+# Launcher 方案（Chrome / Edge）
+# ---------------------------------------------------------------------------
+
+class ChromiumLauncherPatcher:
+    """
+    完全不修改原始 .app bundle，保留其 Google 代码签名。
+    patch：将原始 .app 整体重命名为 *_original.app，在原位置创建最小 launcher .app，
+           launcher 的主二进制是 shell 脚本，exec 原始 binary 并注入 --use-angle=gl。
+    unpatch：删除 launcher，将 *_original.app 重命名恢复。
+    """
+
+    MARKER     = "# patched-by-electron_patcher"
+    ANGLE_FLAG = "--use-angle=gl"
+
+    def __init__(self, app_path: Path, binary_name: str) -> None:
+        self._app_path     = Path(app_path)
+        self._binary_name  = binary_name
+        self._backup_app   = self._app_path.with_name(f"{self._app_path.stem}_original.app")
+        self._launcher_bin = self._app_path / "Contents" / "MacOS" / binary_name
+        self._original_bin = self._backup_app / "Contents" / "MacOS" / binary_name
+
+    def is_already_patched(self) -> bool:
+        try:
+            return (self._launcher_bin.exists() and
+                    self.MARKER in self._launcher_bin.read_text(errors="ignore"))
+        except Exception:
+            return False
+
+    def patch(self) -> None:
+        if not self._app_path.exists():
+            print(f"  App not found: {self._app_path}")
+            return
+        if self.is_already_patched():
+            print(f"  Already patched: {self._app_path.name}")
+            return
+
+        # 1. 将原始 .app bundle 整体重命名备份（签名原封不动）
+        if not self._backup_app.exists():
+            print(f"  Preserving original app → {self._backup_app.name}")
+            self._app_path.rename(self._backup_app)
+
+        # 2. 创建 launcher bundle 目录结构
+        (self._app_path / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+
+        # 3. 从原始 app 复制 Info.plist（保留 bundle ID、URL scheme 等所有元数据）
+        src_plist = self._backup_app / "Contents" / "Info.plist"
+        dst_plist = self._app_path / "Contents" / "Info.plist"
+        if src_plist.exists():
+            shutil.copy2(src_plist, dst_plist)
+
+        # 4. 复制图标资源（保持 Dock / Finder 外观一致）
+        src_res = self._backup_app / "Contents" / "Resources"
+        dst_res = self._app_path / "Contents" / "Resources"
+        if src_res.exists():
+            dst_res.mkdir(exist_ok=True)
+            for icns in src_res.glob("*.icns"):
+                shutil.copy2(icns, dst_res / icns.name)
+
+        # 5. 写入 launcher shell 脚本
+        script = (
+            f"#!/bin/bash\n"
+            f"{self.MARKER}\n"
+            f'exec "{self._original_bin}" {self.ANGLE_FLAG} "$@"\n'
+        )
+        self._launcher_bin.write_text(script)
+        self._launcher_bin.chmod(0o755)
+
+        # 6. 对 launcher bundle 进行 ad-hoc 签名（原始 bundle 完整保留，不做任何修改）
+        print(f"  Signing launcher...")
+        result = subprocess.run(
+            ["codesign", "--force", "--sign", "-", str(self._app_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  WARNING: codesign failed: {result.stderr.strip()}")
+        else:
+            print(f"  Done: launcher at original path, original preserved as {self._backup_app.name}")
+
+    def unpatch(self) -> None:
+        if not self._backup_app.exists():
+            print(f"  No backup found, nothing to restore: {self._app_path.name}")
+            return
+        print(f"  Removing launcher, restoring original app...")
+        if self._app_path.exists():
+            shutil.rmtree(self._app_path)
+        self._backup_app.rename(self._app_path)
+        print(f"  Restored: {self._app_path.name}")
+
+
+# ---------------------------------------------------------------------------
 # 扫描：发现所有可 patch 的应用
 # ---------------------------------------------------------------------------
 
@@ -217,8 +310,8 @@ LOCAL_STATE_CANDIDATES = [
     ("Void",              "~/Library/Application Support/Void"),
 ]
 
-# Chrome / Edge 固定列表（二进制方式）
-BINARY_PATCH_CANDIDATES = [
+# Chrome / Edge 固定列表（Launcher 方案：保留原始 bundle，不破坏 Keychain）
+LAUNCHER_PATCH_CANDIDATES = [
     # Chrome 系列
     ("/Applications/Google Chrome.app",         "Google Chrome"),
     ("/Applications/Google Chrome Beta.app",    "Google Chrome Beta"),
@@ -228,8 +321,11 @@ BINARY_PATCH_CANDIDATES = [
     ("/Applications/Microsoft Edge Beta.app",   "Microsoft Edge Beta"),
     ("/Applications/Microsoft Edge Dev.app",    "Microsoft Edge Dev"),
     ("/Applications/Microsoft Edge Canary.app", "Microsoft Edge Canary"),
-    # 无 Local State 的 Electron 应用
-    ("/Applications/汽水音乐.app",               "汽水音乐"),
+]
+
+# 无 Local State、无 Keychain 顾虑的 Electron 应用（二进制方式）
+BINARY_PATCH_CANDIDATES = [
+    ("/Applications/汽水音乐.app", "汽水音乐"),
 ]
 
 
@@ -237,8 +333,8 @@ def scan_apps() -> list[dict]:
     """
     扫描所有可 patch 的应用，返回候选列表。
     每项格式：
-      { "name": str, "type": "local_state" | "binary",
-        "patched": bool, "patcher": ChromiumSettingsPatcher | ChromiumBinaryPatcher }
+      { "name": str, "type": "local_state" | "launcher" | "binary",
+        "patched": bool, "patcher": ChromiumSettingsPatcher | ChromiumLauncherPatcher | ChromiumBinaryPatcher }
     """
     apps = []
     seen_state_files: set[Path] = set()
@@ -326,7 +422,22 @@ def scan_apps() -> list[dict]:
                 "patcher": patcher,
             })
 
-    # 4. 扫描 Chrome / Edge（二进制方式）
+    # 4. Chrome / Edge（Launcher 方案）
+    for app_path_str, binary_name in LAUNCHER_PATCH_CANDIDATES:
+        app_path = Path(app_path_str)
+        # 已 patch 时原始 .app 被重命名，需同时检查 launcher 和备份是否存在
+        backup_app = app_path.with_name(f"{app_path.stem}_original.app")
+        if not app_path.exists() and not backup_app.exists():
+            continue
+        patcher = ChromiumLauncherPatcher(app_path, binary_name)
+        apps.append({
+            "name":    binary_name,
+            "type":    "launcher",
+            "patched": patcher.is_already_patched(),
+            "patcher": patcher,
+        })
+
+    # 5. 其他无 Keychain 顾虑的 Electron 应用（二进制方式）
     for app_path_str, binary_name in BINARY_PATCH_CANDIDATES:
         app_path = Path(app_path_str)
         if not app_path.exists():
@@ -432,7 +543,7 @@ def print_menu(apps: list[dict], mode: str) -> None:
     print("  #   应用名称                          类型            状态")
     print("  " + "-" * 65)
     for i, app in enumerate(apps, 1):
-        kind   = "Binary 注入" if app["type"] == "binary" else "Local State"
+        kind   = {"binary": "Binary 注入", "launcher": "Launcher", "local_state": "Local State"}.get(app["type"], app["type"])
         status = "[已 patch]" if app["patched"] else ""
         print(f"  {i:<3} {app['name']:<36} {kind:<15} {status}")
     if mode == "patch":
